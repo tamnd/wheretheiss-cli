@@ -25,9 +25,8 @@ func TestDomainInfo(t *testing.T) {
 
 func TestClassify(t *testing.T) {
 	cases := []struct{ in, typ, id string }{
-		{"wiki/Go", "page", "wiki/Go"},
-		{"/about/", "page", "about"},
-		{"https://" + Host + "/team/contact", "page", "team/contact"},
+		{"25544", "position", "25544"},
+		{"iss", "position", "iss"},
 	}
 	for _, tc := range cases {
 		typ, id, err := Domain{}.Classify(tc.in)
@@ -39,38 +38,31 @@ func TestClassify(t *testing.T) {
 }
 
 func TestLocate(t *testing.T) {
-	got, err := Domain{}.Locate("page", "wiki/Go")
-	want := "https://" + Host + "/wiki/Go"
+	got, err := Domain{}.Locate("position", "25544")
+	want := BaseURL + "/v1/satellites/25544"
 	if err != nil || got != want {
 		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
 	}
 }
 
-// TestHostWiring mounts the driver in a kit Host (the runtime ant drives) and
-// checks the round trip: a record mints to its URI, its body is readable, and a
-// bare id resolves back to the same URI. The init in domain.go registers the
-// domain, so kit.Open finds it.
+// TestHostWiring mounts the driver in a kit Host and checks the round trip.
 func TestHostWiring(t *testing.T) {
 	h, err := kit.Open()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	p := &Page{ID: "wiki/Go", URL: "https://" + Host + "/wiki/Go", Title: "Go", Body: "Go is a language."}
+	p := &Position{Name: "iss", ID: ISSID, Latitude: -21.4, Longitude: -79.4, Units: "kilometers"}
 	u, err := h.Mint(p)
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
-	if want := "wheretheiss://page/wiki/Go"; u.String() != want {
+	if want := "wheretheiss://position/iss"; u.String() != want {
 		t.Errorf("Mint = %q, want %q", u.String(), want)
 	}
 
-	if body, ok := h.Body(p); !ok || body == "" {
-		t.Errorf("Body = (%q, %v), want non-empty", body, ok)
-	}
-
-	got, err := h.ResolveOn("wheretheiss", "about")
-	if err != nil || got.String() != "wheretheiss://page/about" {
-		t.Errorf("ResolveOn = (%q, %v), want wheretheiss://page/about", got.String(), err)
+	got, err := h.ResolveOn("wheretheiss", "25544")
+	if err != nil || got.String() != "wheretheiss://position/25544" {
+		t.Errorf("ResolveOn = (%q, %v), want wheretheiss://position/25544", got.String(), err)
 	}
 }
