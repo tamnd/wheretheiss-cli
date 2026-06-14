@@ -1,38 +1,56 @@
 // Package wheretheiss is the library behind the wheretheiss command line:
-// the HTTP client, request shaping, and the typed data models for wheretheiss.
+// the HTTP client, request shaping, and the typed data models for the
+// Where The ISS At API (api.wheretheiss.at).
 //
 // The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// User-Agent, paces requests, and retries transient failures (429, 5xx).
 package wheretheiss
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to wheretheiss. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "wheretheiss/dev (+https://github.com/tamnd/wheretheiss-cli)"
-
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at wheretheiss.com; change it once you
-// know the real endpoints you want to read.
-const Host = "wheretheiss.com"
+// Host is the API hostname this client talks to.
+const Host = "api.wheretheiss.at"
 
 // BaseURL is the root every request is built from.
 const BaseURL = "https://" + Host
 
-// Client talks to wheretheiss over HTTP.
+// ISSID is the NORAD catalog number for the International Space Station.
+const ISSID = 25544
+
+// Config holds tuneable settings for the client.
+type Config struct {
+	BaseURL   string
+	UserAgent string
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
+}
+
+// DefaultConfig returns production-ready defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   BaseURL,
+		Rate:      500 * time.Millisecond,
+		Timeout:   15 * time.Second,
+		Retries:   3,
+		UserAgent: "wheretheiss-cli/0.1 (tamnd87@gmail.com)",
+	}
+}
+
+// Client talks to the Where The ISS At API over HTTP.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
+	BaseURL   string
 	// Rate is the minimum gap between requests. Zero means no pacing.
 	Rate    time.Duration
 	Retries int
@@ -40,20 +58,69 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults.
 func NewClient() *Client {
+	cfg := DefaultConfig()
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		HTTP:      &http.Client{Timeout: cfg.Timeout},
+		UserAgent: cfg.UserAgent,
+		BaseURL:   cfg.BaseURL,
+		Rate:      cfg.Rate,
+		Retries:   cfg.Retries,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
+// Position is a single ISS position record, as returned by the API.
+type Position struct {
+	Name       string  `json:"name"       kit:"id"`
+	ID         int     `json:"id"`
+	Latitude   float64 `json:"latitude"`
+	Longitude  float64 `json:"longitude"`
+	Altitude   float64 `json:"altitude"`
+	Velocity   float64 `json:"velocity"`
+	Visibility string  `json:"visibility"`
+	Timestamp  int64   `json:"timestamp"`
+	Units      string  `json:"units"`
+}
+
+// CurrentPosition fetches the live ISS position.
+func (c *Client) CurrentPosition(ctx context.Context) (*Position, error) {
+	url := fmt.Sprintf("%s/v1/satellites/%d", c.BaseURL, ISSID)
+	body, err := c.Get(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	var p Position
+	if err := json.Unmarshal(body, &p); err != nil {
+		return nil, fmt.Errorf("decode position: %w", err)
+	}
+	return &p, nil
+}
+
+// HistoricalPositions fetches ISS positions at the given Unix timestamps.
+func (c *Client) HistoricalPositions(ctx context.Context, timestamps []int64) ([]*Position, error) {
+	if len(timestamps) == 0 {
+		return nil, fmt.Errorf("at least one timestamp required")
+	}
+	parts := make([]string, len(timestamps))
+	for i, ts := range timestamps {
+		parts[i] = strconv.FormatInt(ts, 10)
+	}
+	url := fmt.Sprintf("%s/v1/satellites/%d/positions?timestamps=%s",
+		c.BaseURL, ISSID, strings.Join(parts, ","))
+	body, err := c.Get(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	var positions []*Position
+	if err := json.Unmarshal(body, &positions); err != nil {
+		return nil, fmt.Errorf("decode positions: %w", err)
+	}
+	return positions, nil
+}
+
+// Get fetches the URL and returns the response body. It paces and retries
+// according to the client's settings.
 func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
@@ -121,80 +188,4 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on wheretheiss.com. It is a stand-in for the typed records you
-// will model from the real wheretheiss endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `wheretheiss cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }
